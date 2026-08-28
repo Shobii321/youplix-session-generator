@@ -13,16 +13,25 @@ globalThis.crypto = combinedCrypto;
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { default: makeWASocket, useMultiFileAuthState, Browsers, delay } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, Browsers, delay, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 const PORT = process.env.PORT || 3000;
 const activeSockets = new Map();
+const serverLogs = [];
+
+function log(msg) {
+    const line = `[${new Date().toISOString()}] ${msg}`;
+    console.log(line);
+    serverLogs.push(line);
+    if (serverLogs.length > 100) serverLogs.shift();
+}
 
 function formatPhoneNumber(input) {
     let clean = (input || '').replace(/[^0-9]/g, '');
     if (clean.startsWith('03')) clean = '92' + clean.slice(1);
     else if (clean.startsWith('0092')) clean = '92' + clean.slice(4);
+    else if (clean.length === 10 && clean.startsWith('3')) clean = '92' + clean;
     return clean;
 }
 
@@ -46,7 +55,7 @@ function cleanupSocket(phone) {
 
 async function startPairingSession(phone) {
     const cleanPhone = formatPhoneNumber(phone);
-    if (!cleanPhone || cleanPhone.length < 9) {
+    if (!cleanPhone || cleanPhone.length < 10) {
         return { success: false, message: 'Please enter a valid phone number with country code (e.g. 923270321760)' };
     }
 
@@ -55,18 +64,8 @@ async function startPairingSession(phone) {
     const tempDir = path.join(process.cwd(), 'temp_sessions', `pair_${cleanPhone}_${Date.now()}`);
     if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
-    const { state, saveCreds } = await useMultiFileAuthState(tempDir);
-
-    const sock = makeWASocket({
-        logger: pino({ level: 'silent' }),
-        auth: state,
-        browser: Browsers.ubuntu('Chrome'),
-        printQRInTerminal: false,
-        syncFullHistory: false
-    });
-
     const sessionData = {
-        sock,
+        sock: null,
         tempDir,
         status: 'requesting',
         code: null,
@@ -76,24 +75,44 @@ async function startPairingSession(phone) {
     };
     activeSockets.set(cleanPhone, sessionData);
 
-    sock.ev.on('creds.update', saveCreds);
+    async function createSocket() {
+        const { state, saveCreds } = await useMultiFileAuthState(tempDir);
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection } = update;
+        const sock = makeWASocket({
+            logger: pino({ level: 'silent' }),
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+            },
+            browser: Browsers.macOS('Desktop'),
+            printQRInTerminal: false,
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 25000
+        });
 
-        if (connection === 'open') {
-            console.log(`🎉 [PAIRING SUCCESS]: Connected for ${cleanPhone}!`);
-            try {
-                await delay(1500);
-                const credsPath = path.join(tempDir, 'creds.json');
-                if (fs.existsSync(credsPath)) {
-                    const raw = fs.readFileSync(credsPath, 'utf-8');
-                    const sessionId = 'YOUPLIX~' + Buffer.from(raw).toString('base64');
-                    sessionData.sessionId = sessionId;
-                    sessionData.status = 'connected';
+        sessionData.sock = sock;
+        sock.ev.on('creds.update', saveCreds);
 
-                    const myJid = (sock.user?.id ? sock.user.id.split(':')[0] : cleanPhone) + '@s.whatsapp.net';
-                    const dmMessage = 
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+
+            if (connection === 'open') {
+                log(`🎉 [PAIRING SUCCESS]: WhatsApp linked for ${cleanPhone}!`);
+                try {
+                    await delay(1500);
+                    const credsPath = path.join(tempDir, 'creds.json');
+                    if (fs.existsSync(credsPath)) {
+                        const raw = fs.readFileSync(credsPath, 'utf-8');
+                        const sessionId = 'YOUPLIX~' + Buffer.from(raw).toString('base64');
+                        sessionData.sessionId = sessionId;
+                        sessionData.status = 'connected';
+
+                        const myJid = (sock.user?.id ? sock.user.id.split(':')[0] : cleanPhone) + '@s.whatsapp.net';
+                        const dmMessage = 
 `╔══════════════════════════════════╗
 ║  👑 *YOUPLIX SESSION GENERATOR*  ║
 ╚══════════════════════════════════╝
@@ -113,31 +132,51 @@ async function startPairingSession(phone) {
 ⚠️ *Never share your session ID with strangers.*
 👑 *Bot Engine Created By:* Shobii (03270321760)`;
 
-                    try {
-                        await sock.sendMessage(myJid, { text: dmMessage });
-                        console.log(`📨 [DM SENT]: Session ID delivered to ${cleanPhone}`);
-                    } catch (e) {
-                        console.error('Failed to send DM:', e.message);
+                        try {
+                            await sock.sendMessage(myJid, { text: dmMessage });
+                            log(`📨 [DM DELIVERED]: Session ID sent to WhatsApp for ${cleanPhone}`);
+                        } catch (e) {
+                            log(`❌ Failed to send DM: ${e.message}`);
+                        }
                     }
+                } catch (e) {
+                    sessionData.error = e.message;
+                    log(`❌ Creds packaging error: ${e.message}`);
                 }
-            } catch (e) {
-                sessionData.error = e.message;
+                setTimeout(() => cleanupSocket(cleanPhone), 180000);
+            } else if (connection === 'close') {
+                log(`⚠️ Connection closed for ${cleanPhone} (code: ${statusCode})`);
+                if (sessionData.status === 'connected') return;
+
+                // When user enters pairing code in phone, WhatsApp triggers restartRequired (515) to complete handshake!
+                if (statusCode === DisconnectReason.restartRequired || statusCode === 515 || statusCode === 428 || statusCode === DisconnectReason.connectionLost) {
+                    log(`🔄 Handshake in progress for ${cleanPhone}. Reconnecting socket to complete linking...`);
+                    await delay(1500);
+                    createSocket();
+                } else if (statusCode === DisconnectReason.loggedOut) {
+                    sessionData.status = 'closed';
+                    cleanupSocket(cleanPhone);
+                }
             }
-            setTimeout(() => cleanupSocket(cleanPhone), 120000);
-        } else if (connection === 'close') {
-            if (sessionData.status !== 'connected') sessionData.status = 'closed';
-        }
-    });
+        });
+
+        return sock;
+    }
+
+    const sock = await createSocket();
 
     try {
-        await delay(2000);
+        // Wait 3.5 seconds for WebSocket handshake to be ready before requesting code
+        await delay(3500);
         const rawCode = await sock.requestPairingCode(cleanPhone);
         const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
         sessionData.code = formatted;
         sessionData.status = 'waiting';
+        log(`🔑 [CODE ISSUED] for ${cleanPhone}: ${formatted}`);
         return { success: true, code: formatted, phone: cleanPhone };
     } catch (err) {
         cleanupSocket(cleanPhone);
+        log(`❌ Error requesting pairing code: ${err.message}`);
         return { success: false, message: err.message || 'Failed to request code. Check number.' };
     }
 }
@@ -517,7 +556,13 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/version') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ version: 'v2.2', cryptoSubtle: typeof globalThis.crypto?.subtle !== 'undefined' }));
+        res.end(JSON.stringify({ version: 'v2.3', cryptoSubtle: typeof globalThis.crypto?.subtle !== 'undefined' }));
+        return;
+    }
+
+    if (pathname === '/api/logs') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ logs: serverLogs }));
         return;
     }
 
