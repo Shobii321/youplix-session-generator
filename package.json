@@ -1,0 +1,16 @@
+{
+  "name": "youplix-session-generator",
+  "version": "1.0.0",
+  "description": "WhatsApp Reusable Session ID Generator Portal like session.silvatech.co.ke",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^9.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
