@@ -1,10 +1,14 @@
 const nodeCrypto = require('crypto');
-if (!globalThis.crypto) {
-    globalThis.crypto = nodeCrypto.webcrypto || nodeCrypto;
-}
-if (!global.crypto) {
-    global.crypto = globalThis.crypto;
-}
+const webcrypto = nodeCrypto.webcrypto || {};
+const combinedCrypto = new Proxy(nodeCrypto, {
+    get(target, prop) {
+        if (prop in target) return target[prop];
+        if (prop in webcrypto) return webcrypto[prop];
+        return undefined;
+    }
+});
+global.crypto = combinedCrypto;
+globalThis.crypto = combinedCrypto;
 
 const http = require('http');
 const fs = require('fs');
@@ -508,6 +512,12 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/' || pathname === '/pair' || pathname === '/session') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(getWebPageHtml());
+        return;
+    }
+
+    if (pathname === '/api/version') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ version: 'v2.2', cryptoSubtle: typeof globalThis.crypto?.subtle !== 'undefined' }));
         return;
     }
 
