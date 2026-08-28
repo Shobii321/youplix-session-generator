@@ -13,7 +13,7 @@ globalThis.crypto = combinedCrypto;
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { default: makeWASocket, useMultiFileAuthState, Browsers, delay, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, Browsers, delay, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 const PORT = process.env.PORT || 3000;
@@ -78,13 +78,20 @@ async function startPairingSession(phone) {
     async function createSocket() {
         const { state, saveCreds } = await useMultiFileAuthState(tempDir);
 
+        let waVersion = [2, 3000, 1046273326];
+        try {
+            const v = await fetchLatestWaWebVersion();
+            if (v && v.version) waVersion = v.version;
+        } catch (e) {}
+
         const sock = makeWASocket({
+            version: waVersion,
             logger: pino({ level: 'silent' }),
             auth: {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
             },
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.ubuntu('Chrome'),
             printQRInTerminal: false,
             syncFullHistory: false,
             markOnlineOnConnect: false,
